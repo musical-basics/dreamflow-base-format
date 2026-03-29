@@ -44,6 +44,8 @@ export function vexKeyToMidi(key: string): number | undefined {
     return (octave + 1) * 12 + baseSemitone + accidentalShift
 }
 
+// ─── Velocity → CSS Color (matches waterfall hue mapping) ─────────
+
 /**
  * Convert MIDI velocity (0-127) to an HSL CSS color string.
  * Same hue mapping as WaterfallRenderer: soft (purple, hue 270) → loud (red, hue 0).
@@ -56,6 +58,8 @@ export function velocityToCSS(velocity: number): string {
     else hue = 270 * (1 - ((v - 20) / 90))
     return `hsl(${Math.round(hue)}, 85%, 55%)`
 }
+
+// ─── Core Matching Algorithm ──────────────────────────────────────
 
 /**
  * Convert a score position (measure + timestamp fraction) to absolute audio time
@@ -87,9 +91,11 @@ function scorePositionToTime(
         .sort((a, b) => a.beat - b.beat)
 
     if (measureBeatAnchors.length >= 2) {
-        const timeSigNum = 4 
+        // Convert timestamp fraction to beat number (1-indexed)
+        const timeSigNum = 4 // default; could be passed through
         const beatNumber = 1 + timestamp * timeSigNum
 
+        // Find surrounding beat anchors
         let before: BeatAnchor | undefined
         let after: BeatAnchor | undefined
         for (const ba of measureBeatAnchors) {
@@ -104,18 +110,25 @@ function scorePositionToTime(
         if (before) return before.time
     }
 
+    // Fallback: linear interpolation between measure anchors
     if (nextAnchor && nextAnchor.measure > currentAnchor.measure) {
         const measureSpan = nextAnchor.measure - currentAnchor.measure
         const measureOffset = (measure - currentAnchor.measure + timestamp) / measureSpan
         return currentAnchor.time + measureOffset * (nextAnchor.time - currentAnchor.time)
     }
 
-    return currentAnchor.time + timestamp * 2 
+    // Last resort: estimate from current anchor
+    return currentAnchor.time + timestamp * 2 // rough 2s/measure estimate
 }
 
 /**
  * Bake MIDI velocity and duration data onto NoteData entries by matching
  * score notes to MIDI notes via time and pitch proximity.
+ *
+ * @param noteMap - Map of measure number → NoteData[]
+ * @param parsedMidi - Parsed MIDI file data
+ * @param anchors - Measure-level time anchors
+ * @param beatAnchors - Beat-level time anchors
  */
 export function bakeMidiOntoNotes(
     noteMap: Map<number, NoteData[]>,
@@ -124,6 +137,7 @@ export function bakeMidiOntoNotes(
     beatAnchors: BeatAnchor[]
 ): void {
     if (!parsedMidi || parsedMidi.notes.length === 0 || anchors.length === 0) {
+        // Clear any previously baked values
         noteMap.forEach(notes => notes.forEach(n => {
             n.velocity = undefined
             n.midiDurationSec = undefined
@@ -131,7 +145,7 @@ export function bakeMidiOntoNotes(
         return
     }
 
-    const midiNotes = parsedMidi.notes 
+    const midiNotes = parsedMidi.notes // already sorted by startTimeSec
     let matchCount = 0
     let missCount = 0
 
@@ -142,6 +156,7 @@ export function bakeMidiOntoNotes(
             const absTime = scorePositionToTime(measure, note.timestamp, anchors, beatAnchors)
             if (absTime === undefined) { missCount++; continue }
 
+            // Binary search for MIDI notes near this time
             let lo = 0, hi = midiNotes.length - 1
             while (lo < hi) {
                 const mid = (lo + hi) >>> 1
@@ -149,6 +164,7 @@ export function bakeMidiOntoNotes(
                 else hi = mid
             }
 
+            // Search a window around the binary search result
             let bestMatch: NoteEvent | undefined
             let bestScore = Infinity
 
@@ -156,15 +172,18 @@ export function bakeMidiOntoNotes(
                 const mn = midiNotes[i]
                 const timeDiff = Math.abs(mn.startTimeSec - absTime)
                 if (timeDiff > 0.3) {
-                    if (mn.startTimeSec > absTime + 0.3) break 
+                    if (mn.startTimeSec > absTime + 0.3) break // past the window
                     continue
                 }
 
+                // Score: time proximity + pitch match bonus
                 let score = timeDiff
+
+                // If we have pitch info, boost matches with overlapping pitch
                 if (note.pitches && note.pitches.length > 0) {
                     const pitchMatch = note.pitches.includes(mn.pitch)
-                    if (pitchMatch) score -= 0.2 
-                    else score += 0.1 
+                    if (pitchMatch) score -= 0.2 // strong bonus for pitch match
+                    else score += 0.1 // penalty for pitch mismatch
                 }
 
                 if (score < bestScore) {

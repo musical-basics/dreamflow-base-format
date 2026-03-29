@@ -89,9 +89,12 @@ export function isBeamable(duration: string): boolean {
 
 /**
  * Create and attach an articulation modifier to a StaveNote.
+ * VexFlow automatically positions articulations on the notehead side:
+ *  - Below for stem-up notes, above for stem-down notes.
  */
 export function addArticulation(staveNote: StaveNote, artCode: string): void {
     const art = new Articulation(artCode)
+    // Let VexFlow auto-position based on stem direction (notehead side)
     staveNote.addModifier(art)
 }
 
@@ -105,6 +108,7 @@ export type TupletData = {
 
 /**
  * Convert a VexFlow duration string to beats (in quarter-note units).
+ * e.g. 'w'=4, 'h'=2, 'q'=1, '8'=0.5, '16'=0.25
  */
 export function durationToBeats(dur: string): number {
     const base = dur.replace(/[rd]/g, '')
@@ -127,11 +131,13 @@ export function calculateVoiceDuration(notes: IntermediateNote[]): number {
     let totalBeats = 0
     for (const n of notes) {
         let beats = durationToBeats(n.duration)
+        // Apply dots: each dot adds half of the previous addition
         let dotValue = beats / 2
         for (let d = 0; d < n.dots; d++) {
             beats += dotValue
             dotValue /= 2
         }
+        // If note already has tuplet time-modification, apply it
         if (n.tupletActual && n.tupletNormal) {
             beats = beats * n.tupletNormal / n.tupletActual
         }
@@ -141,7 +147,11 @@ export function calculateVoiceDuration(notes: IntermediateNote[]): number {
 }
 
 /**
- * Heuristic triplet detection.
+ * Heuristic triplet detection: detects groups of 3 consecutive eighth notes
+ * that aren't marked as tuplets in the MusicXML, but MUST be triplets because
+ * the voice's total note values exceed the measure capacity.
+ *
+ * Returns array of newly detected tuplet groups to add.
  */
 export function detectHeuristicTuplets(
     voiceNotes: IntermediateNote[],
@@ -154,6 +164,7 @@ export function detectHeuristicTuplets(
     const measureCapacity = timeSigNum * (4 / timeSigDen)
     const totalBeats = calculateVoiceDuration(voiceNotes)
 
+    // Only detect triplets if voice overflows the measure
     if (totalBeats <= measureCapacity + 0.01) return []
 
     const detected: TupletData[] = []
@@ -183,6 +194,7 @@ export function detectHeuristicTuplets(
 
 /**
  * Create a VexFlow GraceNoteGroup from IntermediateNote.graceNotes
+ * and attach it to the given StaveNote.
  */
 export function attachGraceNotes(
     mainNote: StaveNote,
@@ -196,10 +208,11 @@ export function attachGraceNotes(
         const graceClef = clef || (staffIndex === 0 ? 'treble' : 'bass')
         const gnote = new GraceNote({
             keys: gn.keys,
-            duration: gn.duration.replace(/[rd]/g, '') || '8', 
+            duration: gn.duration.replace(/[rd]/g, '') || '8', // strip rest/dot markers
             clef: graceClef,
-            slash: true, 
+            slash: true, // acciaccatura style (slashed)
         })
+        // Add accidentals to grace notes
         for (let ki = 0; ki < gn.accidentals.length; ki++) {
             const acc = gn.accidentals[ki]
             if (acc) gnote.addModifier(new Articulation(acc), ki)
@@ -214,12 +227,22 @@ export function attachGraceNotes(
 // ─── Slur Helpers ──────────────────────────────────────────────────
 
 export interface SlurData {
+    /** The StaveNote where this slur starts */
     startNote: StaveNote
+    /** The slur number from MusicXML (for matching) */
     slurNumber: number
 }
 
+/**
+ * Track active (open) slurs across the score.
+ * Key: slur number, Value: SlurData with the start note.
+ */
 export type ActiveSlurs = Map<number, SlurData>
 
+/**
+ * Process slur starts/stops for a note and return completed Curve objects.
+ * Active slurs are tracked across measures via the activeSlurs map.
+ */
 export function processSlurs(
     note: IntermediateNote,
     staveNote: StaveNote,
@@ -227,6 +250,7 @@ export function processSlurs(
 ): Curve[] {
     const completedCurves: Curve[] = []
 
+    // Process slur stops first (a note can both stop and start slurs)
     if (note.slurStops) {
         for (const slurNum of note.slurStops) {
             const slurData = activeSlurs.get(slurNum)
@@ -244,6 +268,7 @@ export function processSlurs(
         }
     }
 
+    // Process slur starts
     if (note.slurStarts) {
         for (const slurNum of note.slurStarts) {
             activeSlurs.set(slurNum, { startNote: staveNote, slurNumber: slurNum })

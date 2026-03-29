@@ -90,11 +90,6 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
         rendererRef.current = renderer
 
         const context = renderer.getContext() as RenderContext
-        
-        // Apply colors based on darkMode
-        const color = darkMode ? '#ffffff' : '#000000'
-        context.setFillStyle(color)
-        context.setStrokeStyle(color)
 
         // Track state for rendering
         const measureXMap = new Map<number, number>()
@@ -250,6 +245,8 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
                             addArticulation(staveNote, artCode)
                         }
 
+                        // VexFlow auto-assigns internal IDs — no manual setAttribute needed.
+                        // Double-prefix bug (vf-vf-*) is fixed upstream in dreamflow/util.ts.
                         vfNotes.push(staveNote)
 
                         // Grace notes: attach to this main note
@@ -266,6 +263,7 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
                         allCurves.push(...completedCurves)
 
                         // Tuplet tracking
+
                         if (note.tupletStart) {
                             currentTupletNotes = [staveNote]
                             currentTupletActual = note.tupletActual || 3
@@ -321,6 +319,7 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
                                 } catch { /* ignore */ }
                             }
 
+                            // getSVGElement() is reliable now — double-prefix bug fixed in dreamflow
                             let element: HTMLElement | null = null
                             let pathsAndRects: HTMLElement[] | undefined
                             try {
@@ -333,6 +332,7 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
                                 }
                             } catch { /* ignore */ }
 
+                            // Convert VexFlow keys to MIDI pitch numbers for matching
                             const pitches = note.isRest ? undefined : note.keys
                                 .map(k => vexKeyToMidi(k))
                                 .filter((p): p is number => p !== undefined)
@@ -352,14 +352,18 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
                         })
                     }
 
-                    // Heuristic triplet detection
+                    // Heuristic triplet detection: detect unmarked triplets when
+                    // voice's total note values overflow the measure capacity
                     const heuristicTuplets = detectHeuristicTuplets(
                         voice.notes, vfNotes, measureTuplets,
                         currentTimeSigNum, currentTimeSigDen, measureNumber
                     )
                     measureTuplets.push(...heuristicTuplets)
 
-                    // Flush unclosed tuplets
+                    // Flush any unclosed tuplet at end of voice
+                    // Only flush unclosed tuplets with 2+ notes
+                    // Single-note unclosed tuplets are cross-measure starts (e.g. M16 Voice 1)
+                    // that would produce a misplaced "3" over the wrong notes
                     if (currentTupletNotes && currentTupletNotes.length >= 2) {
                         measureTuplets.push({
                             notes: currentTupletNotes,
@@ -368,6 +372,29 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
                         })
                     }
                     currentTupletNotes = null
+
+                    // Within-measure ties
+                    for (let ni = 0; ni < voice.notes.length - 1; ni++) {
+                        const note = voice.notes[ni]
+                        if (note.isRest) continue
+                        for (let ki = 0; ki < note.tiesToNext.length; ki++) {
+                            if (note.tiesToNext[ki] && ni + 1 < vfNotes.length) {
+                                const nextNote = voice.notes[ni + 1]
+                                if (nextNote && !nextNote.isRest) {
+                                    const matchIdx = nextNote.keys.indexOf(note.keys[ki])
+                                    if (matchIdx >= 0) {
+                                        tieRequests.push({
+                                            firstNote: vfNotes[ni],
+                                            lastNote: vfNotes[ni + 1],
+                                            firstIndices: [ki],
+                                            lastIndices: [matchIdx],
+                                        })
+                                        prevMeasureLastNotes.delete(`${staff.staffIndex}-${note.keys[ki]}`)
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     const vfVoice = new Voice({
                         numBeats: currentTimeSigNum,
@@ -381,7 +408,9 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
 
                     if (beamableNotes.length >= 2) {
                         try {
+                            // Use generous beam groups to avoid splitting across beat boundaries
                             const groups = [new Fraction(currentTimeSigNum, currentTimeSigDen)]
+                            // For multi-voice, force beam stem direction to match voice
                             const beamOpts: any = { groups }
                             if (stemDir !== undefined) {
                                 beamOpts.stemDirection = stemDir
@@ -393,9 +422,10 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
                 }
             }
 
-            // ── Format ──
+            // ── Format: joinVoices per-stave, format all together ──
             if (vfVoices.length > 0) {
                 const formatter = new Formatter()
+                // Group voices by stave for joinVoices (collision handling within a stave)
                 const voicesByStave = new Map<Stave, Voice[]>()
                 vfVoices.forEach(v => {
                     const stave = voiceStaveMap.get(v)!
@@ -404,11 +434,13 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
                 })
                 voicesByStave.forEach(voices => formatter.joinVoices(voices))
 
-                // Create Tuplet objects BEFORE formatting
+                // Create Tuplet objects BEFORE formatting so VexFlow adjusts tick counts
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
                 const vfTuplets: any[] = []
                 measureTuplets.forEach(t => {
                     try {
+                        // Manually apply tick ratio BEFORE Tuplet constructor
+                        // (Tuplet constructor in VexFlow v5 does NOT modify ticks)
                         for (const note of t.notes) {
                             try {
                                 const n = note as any
@@ -425,7 +457,8 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
                     } catch { /* ignore */ }
                 })
 
-                // Synchronize note start X
+                // Synchronize note start X across all staves so beats align vertically
+                // (prevents clef changes, key sigs, grace notes from offsetting one stave)
                 const staves = Object.values(staveMap)
                 const maxNoteStartX = Math.max(...staves.map(s => {
                     try { return s.getNoteStartX() } catch { return 0 }
@@ -438,16 +471,19 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
                     } catch { /* ignore */ }
                 })
 
+                // Format all voices together using the available width after decorations
+                // Use actual stave width minus padding to prevent notes spilling past barline
                 const noteEndX = Math.min(...staves.map(s => {
                     try { return s.getNoteEndX() } catch { return maxNoteStartX + STAVE_WIDTH - 40 }
                 }))
-                const availableWidth = noteEndX - maxNoteStartX - 10
+                const availableWidth = noteEndX - maxNoteStartX - 10 // 10px right margin
                 formatter.format(vfVoices, Math.max(availableWidth, 100))
 
-                // Post-format: reposition articulations
+                // Post-format: reposition non-fermata articulations for multi-voice staves.
+                // Fermata positioning is now handled upstream in dreamflow (always ABOVE).
                 vfVoices.forEach(v => {
                     const isMulti = multiVoiceVoices.has(v)
-                    if (!isMulti) return
+                    if (!isMulti) return // single-voice staves use VexFlow defaults
                     const tickables = v.getTickables()
                     for (const t of tickables) {
                         const sn = t as StaveNote
@@ -458,6 +494,7 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
                                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
                                 const mod = m as any
                                 if (mod.getCategory?.() === 'articulations' || mod.constructor?.name === 'Articulation') {
+                                    // Skip fermatas — handled upstream
                                     if (mod.isFermata) continue
                                     const pos = stemDir === 1 ? 3 : 4
                                     mod.setPosition(pos)
@@ -468,10 +505,55 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
                     }
                 })
 
-                // Draw
+                // Pre-draw: reposition notes in tuplet measures for proportional spacing
+                // Uses tickContext.getX() (relative positions set by formatter) + setXShift()
+                // Must happen BEFORE draw() so beams/stems render at correct positions
+                if (measureTuplets.length > 0) {
+                    vfVoices.forEach(v => {
+                        const tickables = v.getTickables() as StaveNote[]
+                        if (tickables.length < 2) return
+
+                        try {
+                            // Read formatter-assigned relative X positions via TickContext
+                            const relPositions: number[] = []
+                            const tickValues: number[] = []
+                            for (const t of tickables) {
+                                const tc = (t as any).getTickContext?.()
+                                const relX = tc?.getX?.() ?? 0
+                                relPositions.push(relX)
+                                const ticks = (t as any).getTicks?.()?.value?.() ?? 2048
+                                tickValues.push(ticks)
+                            }
+
+                            const firstX = relPositions[0]
+                            const lastX = relPositions[relPositions.length - 1]
+                            const totalWidth = lastX - firstX
+                            if (totalWidth <= 0) return
+
+                            const totalTicks = tickValues.reduce((s, t) => s + t, 0)
+
+                            // Calculate proportional targets and apply X shifts
+                            let accumulated = 0
+                            for (let i = 0; i < tickables.length; i++) {
+                                const targetX = firstX + (accumulated / totalTicks) * totalWidth
+                                // Dampen shift to 65% — pure proportional is too tight for triplets
+                                const shift = (targetX - relPositions[i]) * 0.65
+                                accumulated += tickValues[i]
+
+                                if (Math.abs(shift) >= 1) {
+                                    try { (tickables[i] as any).setXShift(shift) } catch { /* ignore */ }
+                                }
+                            }
+                        } catch (e) { console.warn(`[TUPLET-SPACE] M${measureNumber} error:`, e) }
+                    })
+                }
+
+                // Draw voices and beams (with XShift applied for proportional spacing)
                 vfVoices.forEach(v => v.draw(context, voiceStaveMap.get(v)!))
                 measureBeams.forEach(b => b.setContext(context).draw())
 
+                // Draw tuplets — centering is now handled upstream by dreamflow.
+                // We still apply scale(0.65) to reduce the visual size of the number.
                 if (containerRef.current) {
                     const svgEl = containerRef.current.querySelector('svg')
                     vfTuplets.forEach(t => {
@@ -484,6 +566,7 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
                                     const textEl = allTexts[i]
                                     const origX = parseFloat(textEl.getAttribute('x') || '0')
                                     const origY = parseFloat(textEl.getAttribute('y') || '0')
+                                    // Scale down the tuplet number and adjust coordinates for the transform
                                     textEl.setAttribute('transform', `scale(0.65)`)
                                     textEl.setAttribute('x', String(origX / 0.65))
                                     textEl.setAttribute('y', String((origY + 20) / 0.65))
@@ -499,12 +582,14 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
                 }
             }
 
+            // Extract accurate coordinates now that formatting is complete
             coordinateExtractors.forEach(extract => extract())
+
             beatXMap.set(measureNumber, measureBeatPositions)
             allNoteData.set(measureNumber, measureNoteData)
         }
 
-        // Draw ties
+        // Draw all ties
         for (const tie of tieRequests) {
             try {
                 new StaveTie({
@@ -513,23 +598,36 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
                     firstIndexes: tie.firstIndices,
                     lastIndexes: tie.lastIndices,
                 }).setContext(context).draw()
-            } catch { /* ignore */ }
+            } catch {
+                // Tie rendering may fail if notes are malformed — skip
+            }
         }
 
-        // Draw slurs
+        // Draw all slur curves
         for (const curve of allCurves) {
             try {
                 curve.setContext(context).draw()
-            } catch { /* ignore */ }
+            } catch {
+                // Curve rendering may fail if notes are malformed — skip
+            }
         }
 
+        // ── Post-render: configure CSS transforms + cache absoluteX ──
         requestAnimationFrame(() => {
             if (!containerRef.current) return
+
             const cLeft = containerRef.current.getBoundingClientRect().left
 
-            allNoteData.forEach((notes) => {
+            let populatedCount = 0, missingCount = 0
+            allNoteData.forEach((notes, measureNum) => {
                 for (const note of notes) {
-                    if (!note.element) continue
+                    if (!note.element) { missingCount++; continue }
+                    populatedCount++
+
+                    // Set CSS transform properties on both the parent element and note-core group.
+                    // The parent gets transforms/filter from ScrollView effects (scale, translateY, glow).
+                    // The note-core child isolates structural geometry from modifiers (grace notes).
+                    // hasGrace check in ScrollView already prevents pop/jump for grace note cases.
                     note.element.style.transformBox = 'fill-box'
                     note.element.style.transformOrigin = 'center center'
                     note.element.style.transition = 'filter 0.1s'
@@ -545,18 +643,26 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
                             p.style.transition = 'fill 0.1s, stroke 0.1s'
                         })
                     }
+
+                    // Cache absoluteX for reveal mode calculations.
+                    // Use note-core group (excludes grace notes) for accurate position —
+                    // grace notes extend the parent's bounding box to the left,
+                    // causing premature reveal in NOTE mode.
                     const coreForX = note.element.querySelector('.vf-note-core') as HTMLElement
                     note.absoluteX = (coreForX || note.element).getBoundingClientRect().left - cLeft
                 }
             })
+            console.log(`[VFR DOM] Elements: populated=${populatedCount} missing=${missingCount}`)
 
             setIsRendered(true)
 
+            // Fire callback with all rendering data
             if (onRenderComplete) {
                 const systemYMap = {
                     top: STAVE_Y_TREBLE - 20,
                     height: SYSTEM_HEIGHT,
                 }
+
                 onRenderComplete({
                     measureXMap,
                     beatXMap,
@@ -567,12 +673,14 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
             }
         })
 
-    }, [score, onRenderComplete, fontsLoaded, musicFont, darkMode])
+    }, [score, onRenderComplete, fontsLoaded, musicFont])
 
+    // Render when score changes
     useEffect(() => {
         renderScore()
     }, [renderScore])
 
+    // Handle resize
     useEffect(() => {
         const handleResize = () => setTimeout(() => renderScore(), 500)
         window.addEventListener('resize', handleResize)
@@ -595,3 +703,4 @@ const VexFlowRendererComponent: React.FC<VexFlowRendererProps> = ({
 
 export const VexFlowRenderer = React.memo(VexFlowRendererComponent)
 export default VexFlowRenderer
+

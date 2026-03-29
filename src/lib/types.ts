@@ -122,33 +122,3 @@ export interface AppState {
     rightHandActive: boolean
     songTitle: string
 }
-
-export interface PianoKeyProps {
-    noteNumber: number
-    isBlack: boolean
-    leftOffset?: number
-}
-
-export interface TransportBarProps {
-    isPlaying: boolean
-    currentTime: number
-    duration: number
-    tempo: number
-    volume: number
-    leftHandActive: boolean
-    rightHandActive: boolean
-    onPlayPause: () => void
-    onStop: () => void
-    onStepBackward: () => void
-    onTimeChange: (time: number) => void
-    onTempoChange: (tempo: number) => void
-    onVolumeChange: (volume: number) => void
-    onLeftHandToggle: () => void
-    onRightHandToggle: () => void
-}
-
-export interface ToolbarProps {
-    songTitle: string
-    onLoadMidi: () => void
-    onOpenSettings: () => void
-}
